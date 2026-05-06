@@ -5,108 +5,159 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- CONFIGURATION ---
-# The screener automatically scans this "Master List" of high-liquidity CSE stocks
 TICKERS = [
     "SAMP.N0000", "DFCC.N0000", "COMB.N0000", "HNB.N0000", "JKH.N0000",
     "HAYL.N0000", "LOLC.N0000", "SUN.N0000", "DIAL.N0000", "ACL.N0000",
-    "TILE.N0000", "LANK.N0000", "RICH.N0000", "VONE.N0000", "NEST.N0000"
+    "TILE.N0000", "LANK.N0000", "RICH.N0000", "VONE.N0000", "MEL.N0000"
 ]
 
-st.set_page_config(page_title="CSE Auto-Alpha", layout="wide")
+st.set_page_config(page_title="CSE Smart Money Screener", layout="wide")
+st.title("🐋 CSE Smart Money & Breakout Screener")
+st.markdown("Scanning for institutional accumulation, major structural breakouts, and early momentum shifts.")
 
-st.title("🏆 Best Value & Growth: Daily Top Picks")
-st.markdown("Analysis based on live data from **Yahoo Finance** and **CSE Market Metrics**.")
-
-@st.cache_data(ttl=3600) # Refreshes data every hour automatically
+@st.cache_data(ttl=3600) 
 def auto_scan():
     scored_results = []
     for t in TICKERS:
         try:
+            # Fetch data (works seamlessly after hours by pulling the last available closed session)
             df = yf.download(t, period="2y", interval="1d", progress=False)
             if df.empty or len(df) < 200: continue
             
-            # Technicals
+            # --- ADVANCED TECHNICAL ANALYSIS (Pure Pandas) ---
+            
+            # 1. Moving Averages
             df['SMA50'] = df['Close'].rolling(50).mean()
             df['SMA200'] = df['Close'].rolling(200).mean()
             
-            curr_close = df['Close'].iloc[-1]
-            s50 = df['SMA50'].iloc[-1]
-            s200 = df['SMA200'].iloc[-1]
+            # 2. RSI (Relative Strength Index) - 14 Day
+            delta = df['Close'].diff()
+            gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+            rs = gain / loss
+            df['RSI'] = 100 - (100 / (1 + rs))
             
-            # Fundamental Data
+            # 3. MACD (Moving Average Convergence Divergence)
+            df['EMA12'] = df['Close'].ewm(span=12, adjust=False).mean()
+            df['EMA26'] = df['Close'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = df['EMA12'] - df['EMA26']
+            df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            
+            # 4. Stochastic Oscillator (14, 3, 3)
+            low14 = df['Low'].rolling(14).min()
+            high14 = df['High'].rolling(14).max()
+            df['Stoch_K'] = 100 * ((df['Close'] - low14) / (high14 - low14))
+            df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+            
+            # 5. Smart Money / Major Breakout Detection (Institutional Volume + Structure)
+            df['Vol_SMA20'] = df['Volume'].rolling(20).mean()
+            df['High_50'] = df['High'].rolling(50).max().shift(1) # Previous 50-day resistance
+            
+            # Extract latest values
+            curr_close = df['Close'].iloc[-1]
+            curr_vol = df['Volume'].iloc[-1]
+            rsi = df['RSI'].iloc[-1]
+            macd = df['MACD'].iloc[-1]
+            macd_sig = df['MACD_Signal'].iloc[-1]
+            stoch_k = df['Stoch_K'].iloc[-1]
+            stoch_d = df['Stoch_D'].iloc[-1]
+            
+            # --- EARLY DETECTION SCORING ALGORITHM ---
+            score = 0
+            signals = []
+            
+            # Filter noise: Ignore minor reversals, look for major structural breakouts
+            is_major_breakout = (curr_close > df['High_50'].iloc[-1]) and (curr_vol > df['Vol_SMA20'].iloc[-1] * 1.5)
+            if is_major_breakout:
+                score += 50
+                signals.append("🔥 MAJOR BREAKOUT (High Vol)")
+                
+            # Early Momentum: MACD crossover below zero (catching the bottom)
+            if (macd > macd_sig) and (df['MACD'].iloc[-2] <= df['MACD_Signal'].iloc[-2]) and (macd < 0):
+                score += 30
+                signals.append("📈 Early MACD Bullish Cross")
+                
+            # Early Momentum: Stochastic crossing up from oversold territory
+            if (stoch_k > stoch_d) and (stoch_k < 30) and (df['Stoch_K'].iloc[-2] <= df['Stoch_D'].iloc[-2]):
+                score += 25
+                signals.append("⚡ Stoch Oversold Reversal")
+                
+            # Trend Health: RSI showing strength but not overbought
+            if 50 < rsi < 70:
+                score += 15
+                
+            # Golden Cross / Pre-Cross
+            s50, s200 = df['SMA50'].iloc[-1], df['SMA200'].iloc[-1]
+            if s50 > s200:
+                score += 20
+            elif (s200 - s50) / s200 < 0.02:
+                score += 15
+                if "Pre-Cross Alert" not in signals: signals.append("⏳ Pre-Cross Alert")
+
+            # Fundamentals
             ticker_obj = yf.Ticker(t)
             info = ticker_obj.info
-            pe = info.get('trailingPE', 20) # Default to 20 if missing
-            pb = info.get('priceToBook', 2)   # Default to 2 if missing
+            pe = info.get('trailingPE', 20)
+            pb = info.get('priceToBook', 2)
             
-            # SCORING ALGORITHM
-            # 1. Value Score (Lower is better, max 40 pts)
-            value_score = max(0, 40 - (pe * 1.5) - (pb * 5))
+            # Value boost
+            if pe < 10 and pb < 1.0: score += 20
             
-            # 2. Momentum Score (30-day growth, max 30 pts)
-            month_ago_price = df['Close'].iloc[-22]
-            growth_pct = (curr_close - month_ago_price) / month_ago_price
-            momentum_score = min(30, growth_pct * 100)
-            
-            # 3. Trend Score (Golden Cross/Bullish, max 30 pts)
-            trend_score = 0
-            status = "Neutral"
-            if s50 > s200:
-                trend_score = 30
-                status = "Bullish"
-                if (df['SMA50'].iloc[-2] <= df['SMA200'].iloc[-2]):
-                    status = "🔥 GOLDEN CROSS"
-                    trend_score = 40 # Bonus for fresh breakout
-            elif (s200 - s50) / s200 < 0.02:
-                status = "⚡ PRE-CROSS"
-                trend_score = 20
-                
-            total_score = value_score + momentum_score + trend_score
-            
-            scored_results.append({
-                "Ticker": t,
-                "Price": round(curr_close, 2),
-                "P/E": round(pe, 2),
-                "P/B": round(pb, 2),
-                "Growth (30d)": f"{round(growth_pct*100, 2)}%",
-                "Signal": status,
-                "Alpha Score": round(total_score, 1),
-                "Data": df
-            })
-        except:
+            if score > 0: # Only list stocks showing some form of life
+                scored_results.append({
+                    "Ticker": t,
+                    "Price": round(curr_close, 2),
+                    "RSI": round(rsi, 1),
+                    "MACD": "Bullish" if macd > macd_sig else "Bearish",
+                    "Score": score,
+                    "Key Signals": " | ".join(signals) if signals else "Accumulating",
+                    "Data": df
+                })
+        except Exception as e:
             continue
     return scored_results
 
-# --- AUTO-EXECUTION ---
-with st.spinner("Analyzing market for best opportunities..."):
+# --- UI RENDERING ---
+with st.spinner("Executing Smart Money Technical Scan..."):
     all_picks = auto_scan()
 
 if all_picks:
-    # Sort by the highest Alpha Score automatically
-    ranked_df = pd.DataFrame(all_picks).sort_values(by="Alpha Score", ascending=False)
+    # Rank by the highest technical score
+    ranked_df = pd.DataFrame(all_picks).sort_values(by="Score", ascending=False)
     
     top_share = ranked_df.iloc[0]
     
-    # Hero Section for the #1 Pick
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.success(f"### 🥇 Top Pick: {top_share['Ticker']}")
-        st.metric("Alpha Score", top_share['Alpha Score'])
+        st.success(f"### 🥇 Top Technical Pick: {top_share['Ticker']}")
+        st.metric("Technical/Smart Money Score", top_share['Score'])
         st.write(f"**Current Price:** LKR {top_share['Price']}")
-        st.write(f"**Valuation:** P/E {top_share['P/E']} | P/B {top_share['P/B']}")
-        st.write(f"**Status:** {top_share['Signal']}")
+        st.write(f"**RSI (14):** {top_share['RSI']}")
+        st.write(f"**MACD Trend:** {top_share['MACD']}")
+        st.info(f"**Primary Catalyst:** {top_share['Key Signals']}")
         
     with col2:
-        # Automatic Chart for Top Pick
+        # Advanced Charting with Subplots for Indicators
+        df_chart = top_share['Data'].tail(150) # Show last 150 days for clarity
+        
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=top_share['Data'].index, y=top_share['Data']['Close'], name="Price"))
-        fig.add_trace(go.Scatter(x=top_share['Data'].index, y=top_share['Data']['SMA50'], name="50 SMA"))
-        fig.add_trace(go.Scatter(x=top_share['Data'].index, y=top_share['Data']['SMA200'], name="200 SMA"))
-        fig.update_layout(template="plotly_dark", height=300, margin=dict(l=0, r=0, t=0, b=0))
+        # Price and SMAs
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Close'], name="Price", line=dict(color='#00ffcc')))
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['SMA50'], name="50 SMA", line=dict(color='orange', dash='dot')))
+        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['High_50'], name="50-Day Res", line=dict(color='red', dash='dash')))
+        
+        fig.update_layout(
+            title=f"{top_share['Ticker']} - Structural Analysis",
+            template="plotly_dark", 
+            height=400,
+            margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
-    st.subheader("📋 Full Market Ranking")
-    st.dataframe(ranked_df.drop(columns=['Data']), use_container_width=True)
+    st.subheader("📋 Full Technical Ranking")
+    display_df = ranked_df.drop(columns=['Data'])
+    st.dataframe(display_df, use_container_width=True)
 else:
-    st.error("Market data currently unavailable. Please check back during CSE trading hours.")
+    st.error("Market data currently unavailable.")
